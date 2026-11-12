@@ -649,6 +649,31 @@ impl OpLog {
                 ),
             > + '_,
     ) {
+        self.iter_from_replay_base_causally_where(from, from_frontiers, to, to_frontiers, None)
+    }
+
+    /// As [`Self::iter_from_replay_base_causally`], but the yielded version
+    /// is filled only for the changes `wanted` accepts; for the rest it is
+    /// stale. Filling it copies the node's whole version vector, which with
+    /// thousands of peers dominates a replay that needs one container.
+    pub(crate) fn iter_from_replay_base_causally_where<'a>(
+        &'a self,
+        from: &VersionVector,
+        from_frontiers: &Frontiers,
+        to: &VersionVector,
+        to_frontiers: &Frontiers,
+        wanted: Option<&'a dyn Fn(&BlockChangeRef, Counter, Counter) -> bool>,
+    ) -> (
+        VersionVector,
+        DiffMode,
+        impl Iterator<
+                Item = (
+                    BlockChangeRef,
+                    (Counter, Counter),
+                    Rc<RefCell<VersionVector>>,
+                ),
+            > + '_,
+    ) {
         let mut merged_vv = from.clone();
         merged_vv.merge(to);
         loro_common::debug!("to_frontiers={:?} vv={:?}", &to_frontiers, to);
@@ -681,10 +706,6 @@ impl OpLog {
             std::iter::from_fn(move || {
                 if let Some(inner) = &node {
                     let mut inner_vv = vv.borrow_mut();
-                    // FIXME: PERF: it looks slow for large vv, like 10000+ entries
-                    inner_vv.clear();
-                    self.dag.ensure_vv_for(&inner.data);
-                    inner_vv.extend_to_include_vv(inner.data.vv.get().unwrap().iter());
                     let peer = inner.data.peer;
                     let cnt = inner
                         .data
@@ -694,6 +715,12 @@ impl OpLog {
                     let dag_node_end = (inner.data.cnt + inner.data.len as Counter)
                         .min(merged_vv.get(&peer).copied().unwrap_or(0));
                     let change = self.change_store.get_change(ID::new(peer, cnt)).unwrap();
+                    if wanted.is_none_or(|wanted| wanted(&change, cnt, dag_node_end)) {
+                        inner_vv.clear();
+                        self.dag.ensure_vv_for(&inner.data);
+                        inner_vv.extend_to_include_vv(inner.data.vv.get().unwrap().iter());
+                        inner_vv.extend_to_include_end_id(change.id);
+                    }
 
                     if change.ctr_end() < dag_node_end {
                         cur_cnt = change.ctr_end();
@@ -701,8 +728,6 @@ impl OpLog {
                         node = iter.next();
                         cur_cnt = 0;
                     }
-
-                    inner_vv.extend_to_include_end_id(change.id);
 
                     Some((change, (cnt, dag_node_end), vv.clone()))
                 } else {
