@@ -220,6 +220,9 @@ impl DiffCalculator {
                     .binary_search_by(|op| op.ctr_last().cmp(&start_counter))
                     .unwrap_or_else(|e| e);
                 let mut visited = FxHashSet::default();
+                // Within a change only its own peer's counter moves, so
+                // whether the other peers cover `before` is asked once.
+                let mut others_cover_before = None;
                 for mut op in &change.ops.vec()[iter_start..] {
                     if op.counter >= end_counter {
                         break;
@@ -287,12 +290,16 @@ impl DiffCalculator {
                     // oplog proved which containers that missing history
                     // touches, only those calculators lose their op context;
                     // the others see exactly the state their ops were made in.
-                    if !vv.includes_vv(before)
-                        && concurrent_containers
-                            .as_ref()
-                            .is_none_or(|set| set.contains(&container))
+                    if concurrent_containers
+                        .as_ref()
+                        .is_none_or(|set| set.contains(&container))
                     {
-                        calculator.mark_source_not_in_op_context();
+                        let peer = change.peer();
+                        let others = *others_cover_before
+                            .get_or_insert_with(|| vv.includes_vv_except(before, peer));
+                        if !others || !vv.includes_peer_of(before, peer) {
+                            calculator.mark_source_not_in_op_context();
+                        }
                     }
 
                     // A replayed op concurrent with the replay base would

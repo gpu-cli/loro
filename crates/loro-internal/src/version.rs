@@ -798,6 +798,22 @@ impl VersionVector {
         }
     }
 
+    /// [`Self::includes_vv`] over every peer of `other` but `skip`,
+    /// stopping at the first that is not covered.
+    pub(crate) fn includes_vv_except(&self, other: &VersionVector, skip: PeerID) -> bool {
+        other.iter().all(|(peer, end)| {
+            *peer == skip
+                || normalize_vv_counter(self.get(peer).copied().unwrap_or(0))
+                    >= normalize_vv_counter(*end)
+        })
+    }
+
+    /// Whether `self` covers `other`'s entry for `peer`.
+    pub(crate) fn includes_peer_of(&self, other: &VersionVector, peer: PeerID) -> bool {
+        normalize_vv_counter(self.get(&peer).copied().unwrap_or(0))
+            >= normalize_vv_counter(other.get(&peer).copied().unwrap_or(0))
+    }
+
     pub fn includes_id(&self, id: ID) -> bool {
         if id.counter < 0 {
             return false;
