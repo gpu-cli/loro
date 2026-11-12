@@ -5,7 +5,7 @@ use crate::{
     id::{Counter, ID},
     oplog::AppDag,
     span::{CounterSpan, IdSpan},
-    LoroError, PeerID,
+    LoroError, Lamport, PeerID,
 };
 use loro_common::{HasCounter, HasCounterSpan, HasIdSpan, HasLamportSpan, IdFull, IdSpanVector};
 use rustc_hash::FxHashMap;
@@ -992,61 +992,74 @@ impl VersionVector {
 }
 
 /// Use minimal set of ids to represent the frontiers
+///
+/// One walk down the DAG in lamport order from the candidates' deps: a
+/// candidate is dropped when an op of its peer at or after it is reached.
+/// Every node is visited at most once and the walk stops below the lowest
+/// candidate, so the cost is linear in the history above the candidates
+/// rather than in candidates times history.
 #[tracing::instrument(skip(dag))]
 pub fn shrink_frontiers(last_ids: &Frontiers, dag: &AppDag) -> Result<Frontiers, ID> {
-    // it only keep the ids of ops that are concurrent to each other
-
     if last_ids.len() <= 1 {
         return Ok(last_ids.clone());
     }
 
-    let mut last_ids = {
-        let ids = filter_duplicated_peer_id(last_ids);
-        if last_ids.len() == 1 {
-            let mut frontiers = Frontiers::default();
-            frontiers.push(last_ids.as_single().unwrap());
-            return Ok(frontiers);
-        }
-
-        let mut last_ids = Vec::with_capacity(ids.len());
-        for id in ids {
-            let Some(lamport) = dag.get_lamport(&id) else {
-                return Err(id);
-            };
-            last_ids.push(IdFull::new(id.peer, id.counter, lamport))
-        }
-
-        last_ids
-    };
-
-    let mut frontiers = Vec::new();
-    // Iterate from the greatest lamport to the smallest
-    last_ids.sort_by_key(|x| x.lamport);
-    for id in last_ids.iter().rev() {
-        let mut should_insert = true;
-        let mut len = 0;
-        // travel backward because they have more similar lamport
-        for f_id in frontiers.iter().rev() {
-            dag.travel_ancestors(*f_id, &mut |x| {
-                len += 1;
-                if x.contains_id(id.id()) {
-                    should_insert = false;
-                    ControlFlow::Break(())
-                } else if x.lamport_last() < id.lamport {
-                    // Already travel to a node with smaller lamport, no need to continue, we are sure two ops are concurrent now
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            });
-        }
-
-        if should_insert {
-            frontiers.push(id.id());
-        }
+    let ids = filter_duplicated_peer_id(last_ids);
+    if ids.len() == 1 {
+        let mut frontiers = Frontiers::default();
+        frontiers.push(ids[0]);
+        return Ok(frontiers);
     }
 
-    Ok(frontiers.into())
+    let mut candidates = Vec::with_capacity(ids.len());
+    let mut min_lamport = Lamport::MAX;
+    for id in ids {
+        let Some(lamport) = dag.get_lamport(&id) else {
+            return Err(id);
+        };
+        min_lamport = min_lamport.min(lamport);
+        candidates.push(IdFull::new(id.peer, id.counter, lamport));
+    }
+
+    let mut pending: std::collections::BinaryHeap<(Lamport, PeerID, Counter)> =
+        std::collections::BinaryHeap::new();
+    let push_deps = |deps: &Frontiers,
+                     pending: &mut std::collections::BinaryHeap<(Lamport, PeerID, Counter)>| {
+        for dep in deps.iter() {
+            if let Some(lamport) = dag.get_lamport(&dep) {
+                pending.push((lamport, dep.peer, dep.counter));
+            }
+        }
+    };
+    for id in candidates.iter() {
+        let Some(node) = crate::dag::Dag::get(dag, id.id()) else {
+            return Err(id.id());
+        };
+        push_deps(&node.deps, &mut pending);
+    }
+
+    let mut reached: FxHashMap<PeerID, Counter> = FxHashMap::default();
+    let mut visited: rustc_hash::FxHashSet<ID> = rustc_hash::FxHashSet::default();
+    while let Some((lamport, peer, counter)) = pending.pop() {
+        if lamport < min_lamport {
+            break;
+        }
+        let highest = reached.entry(peer).or_insert(counter);
+        if counter > *highest {
+            *highest = counter;
+        }
+        let Some(node) = crate::dag::Dag::get(dag, ID::new(peer, counter)) else {
+            continue;
+        };
+        if !visited.insert(ID::new(node.peer, node.cnt)) {
+            continue;
+        }
+        push_deps(&node.deps, &mut pending);
+    }
+
+    candidates.retain(|id| reached.get(&id.peer).is_none_or(|&c| c < id.counter));
+    candidates.sort_by_key(|id| std::cmp::Reverse(id.lamport));
+    Ok(candidates.into_iter().map(|id| id.id()).collect::<Vec<_>>().into())
 }
 
 fn filter_duplicated_peer_id(last_ids: &Frontiers) -> Vec<ID> {
