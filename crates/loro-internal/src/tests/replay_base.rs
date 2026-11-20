@@ -421,13 +421,10 @@ fn criss_cross_sync_never_rebuilds_the_text_tracker() {
     assert_eq!(a.get_text("r").get_richtext_value(), incremental);
 }
 
-/// A persisted calculator replays ops the tracker has already applied
-/// whenever the replay base sits below the version the tracker reached on
-/// an earlier round (the shape `LoroDoc::checkout` produces — driven here
-/// directly through one persisted `DiffCalculator`). The tracker skips
-/// them (`skip_applied`), and the style table must not grow a duplicate
-/// entry per re-replayed StyleStart: trusting the base turns what was a
-/// once-per-retreat re-replay into one on every step.
+/// A forward checkout walk through half-synced frontiers (the shape
+/// `LoroDoc::checkout` produces, driven here directly through one persisted
+/// `DiffCalculator`) replays from each step's base without a rebuild, and
+/// leaves a style table with each StyleStart of its last step once.
 #[test]
 fn persisted_walks_do_not_duplicate_style_entries() {
     use crate::cursor::PosType;
@@ -481,9 +478,14 @@ fn persisted_walks_do_not_duplicate_style_entries() {
     let ContainerDiffCalculator::Richtext(text) = c else {
         panic!("expected a richtext calculator");
     };
+    // Each round starts its tracker at its own base, so the table holds the
+    // last step's styles, each once.
+    let ids = text.tracked_style_ids();
+    let unique: rustc_hash::FxHashSet<_> = ids.iter().copied().collect();
+    assert!(!ids.is_empty());
     assert_eq!(
-        text.tracked_style_ids().len(),
-        2 * rounds,
+        unique.len(),
+        ids.len(),
         "each StyleStart must appear exactly once in the style table"
     );
 }
@@ -580,4 +582,72 @@ fn criss_cross_sync_never_rebuilds_the_list_tracker() {
         rebuilds, 0,
         "concurrent list imports must not rebuild the tracker"
     );
+}
+
+/// A shallow base and a tail written concurrently by many one-shot peers,
+/// imported in one batch, open to the document as written: every rich-text
+/// container the tail touches is rebuilt from the shallow root, replaying
+/// only the changes that touch it, each at a version that names only the
+/// peers its tracker holds.
+#[test]
+fn shallow_base_and_many_writer_tail_open_as_written() {
+    use crate::cursor::PosType;
+    use crate::handler::HandlerTrait;
+
+    const TEXTS: u64 = 8;
+    const SESSIONS: u64 = 3;
+    let doc = LoroDoc::new_auto_commit();
+    doc.set_peer_id(1).unwrap();
+    for i in 0..TEXTS {
+        doc.get_text(format!("t{i}").as_str())
+            .insert_unicode(0, "base text")
+            .unwrap();
+    }
+    doc.commit_then_renew();
+    let base = doc
+        .export(ExportMode::shallow_snapshot(&doc.oplog_frontiers()))
+        .unwrap();
+
+    let sessions: Vec<LoroDoc> = (0..SESSIONS).map(|_| doc.fork()).collect();
+    let mut tail = Vec::new();
+    for round in 0..90u64 {
+        let session = &sessions[(round % SESSIONS) as usize];
+        session.set_peer_id(100 + round).unwrap();
+        let from = session.oplog_vv();
+        let t = session.get_text(format!("t{}", round % TEXTS).as_str());
+        t.insert_unicode(0, "xy").unwrap();
+        let len = t.len_unicode();
+        t.mark(
+            0,
+            3.min(len),
+            "bold",
+            (round % 2 == 0).into(),
+            PosType::Unicode,
+        )
+        .unwrap();
+        t.delete(len - 1, 1, PosType::Unicode).unwrap();
+        session.commit_then_renew();
+        let blob = session.export(ExportMode::updates(&from)).unwrap();
+        doc.import(&blob).unwrap();
+        tail.push(blob);
+        if round % 7 == 6 {
+            for s in &sessions {
+                s.import(&doc.export(ExportMode::updates(&s.oplog_vv())).unwrap())
+                    .unwrap();
+            }
+        }
+    }
+
+    let opened = LoroDoc::new_auto_commit();
+    opened.import(&base).unwrap();
+    opened.import_batch(&tail).unwrap();
+    assert_eq!(opened.oplog_vv(), doc.oplog_vv());
+    assert_eq!(opened.get_deep_value(), doc.get_deep_value());
+    for i in 0..TEXTS {
+        let name = format!("t{i}");
+        assert_eq!(
+            opened.get_text(name.as_str()).get_richtext_value(),
+            doc.get_text(name.as_str()).get_richtext_value()
+        );
+    }
 }

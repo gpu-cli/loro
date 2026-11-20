@@ -1803,6 +1803,7 @@ impl LoroDoc {
         self.set_detached(true);
         let (diff, diff_mode) =
             calc.calc_diff_internal(&oplog, &before, &state.frontiers, after, &frontiers, None);
+        calc.drop_richtext_trackers();
         state.apply_diff(
             InternalDocDiff {
                 origin,

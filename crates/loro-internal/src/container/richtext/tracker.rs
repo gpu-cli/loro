@@ -27,6 +27,13 @@ pub(crate) struct Tracker {
     current_vv: VersionVector,
     rope: CrdtRope,
     id_to_cursor: IdToCursor,
+    /// The versions name only the peers whose ops the tracker holds. A
+    /// checkout then costs the tracker's own peers, not every peer of the
+    /// document: one container's history rarely holds more than a few of a
+    /// document's peers, and a document every write of which is a new peer
+    /// holds thousands. `all_vv` and `current_vv` are then partial and say
+    /// nothing about any other peer.
+    sparse: bool,
 }
 
 impl Default for Tracker {
@@ -43,6 +50,7 @@ impl Tracker {
             id_to_cursor: IdToCursor::default(),
             applied_vv: Default::default(),
             current_vv: Default::default(),
+            sparse: false,
         };
 
         let result = this.rope.tree.push(FugueSpan {
@@ -72,7 +80,16 @@ impl Tracker {
             id_to_cursor: IdToCursor::default(),
             applied_vv: Default::default(),
             current_vv: Default::default(),
+            sparse: false,
         }
+    }
+
+    /// This tracker with versions that name only the peers whose ops it
+    /// holds (see `sparse`). Set before any op is applied.
+    pub(crate) fn into_sparse(mut self) -> Self {
+        debug_assert!(self.applied_vv.is_empty());
+        self.sparse = true;
+        self
     }
 
     #[inline]
@@ -352,13 +369,58 @@ impl Tracker {
     }
 
     fn _checkout(&mut self, vv: &VersionVector, on_diff_status: bool) {
-        // tracing::info!("Checkout to {:?} from {:?}", vv, self.current_vv);
+        self.checkout_inner(
+            Some(vv),
+            |peer| vv.get(&peer).copied().unwrap_or(0),
+            on_diff_status,
+        );
+    }
+
+    /// Check a sparse tracker out to the version that holds `counter_of(peer)`
+    /// ops of each peer, asked only for the peers it holds ops of.
+    pub(crate) fn checkout_by(&mut self, counter_of: impl Fn(PeerID) -> Counter) {
+        debug_assert!(self.sparse);
+        self.checkout_inner(None, counter_of, false);
+    }
+
+    /// `vv` is needed only when the tracker is not sparse.
+    fn checkout_inner(
+        &mut self,
+        vv: Option<&VersionVector>,
+        counter_of: impl Fn(PeerID) -> Counter,
+        on_diff_status: bool,
+    ) {
         if on_diff_status {
             self.rope.clear_diff_status();
         }
 
-        let current_vv = std::mem::take(&mut self.current_vv);
-        let (retreat, forward) = current_vv.diff_iter(vv);
+        let mut current_vv = std::mem::take(&mut self.current_vv);
+        let (retreat, forward): (Vec<IdSpan>, Vec<IdSpan>) = if self.sparse {
+            // A peer with no op here has nothing to retreat or forward.
+            let mut retreat = Vec::new();
+            let mut forward = Vec::new();
+            for peer in self.applied_vv.keys() {
+                let from = current_vv.get(peer).copied().unwrap_or(0).max(0);
+                let to = counter_of(*peer).max(0);
+                if from > to {
+                    retreat.push(IdSpan::new(*peer, to, from));
+                } else if to > from {
+                    forward.push(IdSpan::new(*peer, from, to));
+                }
+            }
+            if !on_diff_status {
+                for span in &retreat {
+                    current_vv.insert(span.peer, span.counter.start);
+                }
+                for span in &forward {
+                    current_vv.insert(span.peer, span.counter.end);
+                }
+            }
+            (retreat, forward)
+        } else {
+            let (retreat, forward) = current_vv.diff_iter(vv.unwrap());
+            (retreat.collect(), forward.collect())
+        };
         let mut updates = Vec::new();
         for span in retreat {
             for c in self.id_to_cursor.iter(span) {
@@ -451,8 +513,8 @@ impl Tracker {
             self.forward(span, &mut updates);
         }
 
-        if !on_diff_status {
-            self.current_vv = vv.clone();
+        if !on_diff_status && !self.sparse {
+            self.current_vv = vv.unwrap().clone();
         } else {
             self.current_vv = current_vv;
         }
@@ -704,6 +766,22 @@ impl Tracker {
     }
 
     pub(crate) fn mark_shallow_root_applied(&mut self, vv: &VersionVector) {
+        if self.sparse {
+            // Ops below the shallow root are trimmed from the oplog and never
+            // replayed, so a peer with nothing seeded here needs no entry.
+            let mut seeded = VersionVector::new();
+            for span in self.rope.tree().iter() {
+                let id = span.real_id();
+                if id.peer != UNKNOWN_PEER_ID {
+                    if let Some(end) = vv.get(&id.peer) {
+                        seeded.insert(id.peer, *end);
+                    }
+                }
+            }
+            self.applied_vv = seeded.clone();
+            self.current_vv = seeded;
+            return;
+        }
         self.applied_vv = vv.clone();
         self.current_vv = vv.clone();
     }

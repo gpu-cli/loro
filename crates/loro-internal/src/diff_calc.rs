@@ -116,6 +116,101 @@ pub(crate) struct DiffCalcVersionInfo<'a> {
     /// nothing above it is concurrent with anything below it. See
     /// `OpLog::iter_from_replay_base_causally`.
     replay_base_is_critical: bool,
+    /// What every container of a round would otherwise work out again from
+    /// whole versions, each as long as the document has peers.
+    round: &'a RoundFacts,
+}
+
+/// The version an op of a replayed change was made at: the version of the
+/// change's DAG node, and the change's own peer up to the op. Read a peer at a
+/// time; copied whole (`full`) only for a calculator that needs it, since a
+/// document can have thousands of peers.
+pub(crate) struct OpVersion {
+    node: crate::version::ImVersionVector,
+    peer: PeerID,
+    own_end: Counter,
+    full: Option<VersionVector>,
+}
+
+impl OpVersion {
+    fn new(node: crate::version::ImVersionVector, change: ID) -> Self {
+        Self {
+            node,
+            peer: change.peer,
+            own_end: change.counter,
+            full: None,
+        }
+    }
+
+    /// The version now also holds the change's ops before `counter`.
+    fn extend_to(&mut self, counter: Counter) {
+        self.own_end = self.own_end.max(counter);
+        if let Some(full) = &mut self.full {
+            full.extend_to_include_end_id(ID::new(self.peer, counter));
+        }
+    }
+
+    /// How many ops of `peer` the version holds.
+    pub(crate) fn counter_of(&self, peer: PeerID) -> Counter {
+        let counter = self.node.get(&peer).copied().unwrap_or(0);
+        if peer == self.peer {
+            counter.max(self.own_end)
+        } else {
+            counter
+        }
+    }
+
+    fn includes_id(&self, id: ID) -> bool {
+        self.counter_of(id.peer) > id.counter
+    }
+
+    fn full(&mut self) -> &VersionVector {
+        let (node, peer, own_end) = (&self.node, self.peer, self.own_end);
+        self.full.get_or_insert_with(|| {
+            let mut vv = VersionVector::from_im_vv(node);
+            vv.extend_to_include_end_id(ID::new(peer, own_end));
+            vv
+        })
+    }
+}
+
+/// Facts about one round of diff calculation that each container's
+/// calculator needs: computed once per round, since each is O(peers) and a
+/// round can touch thousands of containers.
+#[derive(Debug)]
+pub(crate) struct RoundFacts {
+    /// `from ∪ to`.
+    merged_vv: VersionVector,
+    /// `from` has ops `to` lacks.
+    has_retreat: bool,
+    /// The replay base is `from` itself.
+    replay_base_is_from: bool,
+    /// For a shallow document, the version a richtext tracker rebuilt up to
+    /// `merged_vv` is seeded at (see `RichtextDiffCalculator::shallow_seed`).
+    merged_shallow_seed: Option<VersionVector>,
+    /// A shallow document's root version, below which no op is replayed.
+    shallow_root_vv: Option<VersionVector>,
+    /// The changes a richtext rebuild replays, per container, found by one
+    /// walk of the store the first time a container is rebuilt.
+    richtext_changes: std::cell::OnceCell<crate::oplog::ChangesByContainer>,
+}
+
+impl RoundFacts {
+    /// The changes up to `merged_vv` above the replay start (the shallow
+    /// root, or the empty version) with an op on the richtext container
+    /// `idx`, in causal order.
+    fn richtext_changes(&self, oplog: &OpLog, idx: ContainerIdx) -> &[(Lamport, PeerID, Counter)] {
+        self.richtext_changes
+            .get_or_init(|| {
+                let empty = VersionVector::new();
+                let start = self.shallow_root_vv.as_ref().unwrap_or(&empty);
+                oplog.changes_by_container(start, &self.merged_vv, |c| {
+                    c.get_type() == crate::ContainerType::Text
+                })
+            })
+            .get(&idx)
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
 fn changed_containers_between(
@@ -142,6 +237,14 @@ impl DiffCalculator {
                 DiffCalculatorRetainMode::Once { used: false }
             },
         }
+    }
+
+    /// Drop the richtext calculators: a later round never reuses their
+    /// trackers (see `RichtextCalcMode::Crdt`), and a document's persisted
+    /// calculator would otherwise keep one per text container ever diffed.
+    pub(crate) fn drop_richtext_trackers(&mut self) {
+        self.calculators
+            .retain(|_, (_, calc)| !matches!(calc, ContainerDiffCalculator::Richtext(_)));
     }
 
     #[allow(unused)]
@@ -180,7 +283,20 @@ impl DiffCalculator {
                 concurrent_containers,
             },
             iter,
-        ) = oplog.iter_from_replay_base_causally(before, before_frontiers, after, after_frontiers);
+        ) = oplog.iter_from_replay_base_causally_where(
+            before,
+            before_frontiers,
+            after,
+            after_frontiers,
+            // Each op's version is read from its change's DAG node below,
+            // never copied whole.
+            Some(&|_, _, _| false),
+        );
+        // `before` is the closure of `before_frontiers` when the frontiers
+        // name it exactly; a version then covers `before` iff it holds every
+        // frontier, a few lookups instead of a walk over every peer.
+        let before_is_closure_of_frontiers =
+            oplog.dag.frontiers_to_vv(before_frontiers).as_ref() == Some(before);
         // A conservative replay base may be much older than `before`. The causal replay
         // still needs that common history as position context, but containers
         // whose ops are present on both sides cannot contribute to the diff.
@@ -199,6 +315,10 @@ impl DiffCalculator {
         //   calculator reports its own effective mode in the per-container
         //   `InternalContainerDiff::diff_mode`, which is what the state layer's
         //   per-container logic (`need_check` / `need_compare`) consumes.
+        let shallow_root_vv = RichtextDiffCalculator::shallow_root_vv(oplog);
+        let base_shallow_seed = shallow_root_vv
+            .as_ref()
+            .map(|root| RichtextDiffCalculator::shallow_seed(root, &replay_base));
         let mut calc_mode = origin_diff_mode;
         match &mut self.retain_mode {
             DiffCalculatorRetainMode::Once { used } => {
@@ -214,12 +334,20 @@ impl DiffCalculator {
         let affected_set = {
             loro_common::debug!("replay_base: {:?} mode={:?}", &replay_base, calc_mode);
             let mut started_set = FxHashSet::default();
-            for (change, (start_counter, end_counter), vv) in iter {
+            for (change, (start_counter, end_counter), _) in iter {
                 let iter_start = change
                     .ops
                     .binary_search_by(|op| op.ctr_last().cmp(&start_counter))
                     .unwrap_or_else(|e| e);
                 let mut visited = FxHashSet::default();
+                let mut vv = {
+                    use crate::dag::Dag as _;
+                    let node = oplog
+                        .dag
+                        .get(ID::new(change.peer(), start_counter))
+                        .unwrap();
+                    OpVersion::new(oplog.dag.ensure_vv_for(&node), change.id)
+                };
                 // Within a change only its own peer's counter moves, so
                 // whether the other peers cover `before` is asked once.
                 let mut others_cover_before = None;
@@ -257,8 +385,7 @@ impl DiffCalculator {
                         op = stack_sliced_op.as_ref().unwrap();
                     }
 
-                    let vv = &mut vv.borrow_mut();
-                    vv.extend_to_include_end_id(ID::new(change.peer(), op.counter));
+                    vv.extend_to(op.counter);
                     let container = op.container;
                     let depth = oplog.arena.get_depth(container);
                     let (old_depth, calculator) = self.get_or_create_calc(container, depth);
@@ -282,7 +409,17 @@ impl DiffCalculator {
                         } else {
                             calc_mode
                         };
-                        calculator.start_tracking(oplog, &replay_base, container_mode);
+                        if let ContainerDiffCalculator::Richtext(calculator) = calculator {
+                            calculator.start_round(
+                                oplog,
+                                container,
+                                &replay_base,
+                                base_shallow_seed,
+                                container_mode,
+                            );
+                        } else {
+                            calculator.start_tracking(oplog, &replay_base, container_mode);
+                        }
                     }
 
                     // A change whose version misses part of `before` is being
@@ -294,10 +431,15 @@ impl DiffCalculator {
                         .as_ref()
                         .is_none_or(|set| set.contains(&container))
                     {
-                        let peer = change.peer();
-                        let others = *others_cover_before
-                            .get_or_insert_with(|| vv.includes_vv_except(before, peer));
-                        if !others || !vv.includes_peer_of(before, peer) {
+                        let covers_before = if before_is_closure_of_frontiers {
+                            before_frontiers.iter().all(|id| vv.includes_id(id))
+                        } else {
+                            let peer = change.peer();
+                            let others = *others_cover_before
+                                .get_or_insert_with(|| vv.full().includes_vv_except(before, peer));
+                            others && vv.full().includes_peer_of(before, peer)
+                        };
+                        if !covers_before {
                             calculator.mark_source_not_in_op_context();
                         }
                     }
@@ -305,7 +447,7 @@ impl DiffCalculator {
                     // A replayed op concurrent with the replay base would
                     // contradict the base's claimed criticality.
                     debug_assert!(
-                        !replay_base_is_critical || vv.includes_vv(&replay_base),
+                        !replay_base_is_critical || vv.full().includes_vv(&replay_base),
                         "op {}@{} is concurrent with a replay base claimed critical",
                         op.counter,
                         change.peer(),
@@ -318,16 +460,23 @@ impl DiffCalculator {
                         }
                     }
 
-                    if visited.contains(&op.container) {
-                        // don't checkout if we have already checked out this container in this round
-                        calculator.apply_change(oplog, RichOp::new_by_change(&change, op), None);
+                    let at = if visited.insert(container) {
+                        Some(&mut vv)
                     } else {
-                        calculator.apply_change(
-                            oplog,
-                            RichOp::new_by_change(&change, op),
-                            Some(vv),
-                        );
-                        visited.insert(container);
+                        // don't checkout if we have already checked out this container in this round
+                        None
+                    };
+                    let op = RichOp::new_by_change(&change, op);
+                    match calculator {
+                        ContainerDiffCalculator::Richtext(calculator) => {
+                            calculator.apply_change_at(oplog, op, at.map(|at| &*at));
+                        }
+                        ContainerDiffCalculator::List(_)
+                        | ContainerDiffCalculator::MovableList(_) => {
+                            calculator.apply_change(oplog, op, at.map(|at| at.full()));
+                        }
+                        // These read no version.
+                        _ => calculator.apply_change(oplog, op, None),
                     }
                 }
             }
@@ -354,6 +503,17 @@ impl DiffCalculator {
                 .collect()
         };
         let mut ans = FxHashMap::default();
+        let merged_shallow_seed = shallow_root_vv
+            .as_ref()
+            .map(|root| RichtextDiffCalculator::shallow_seed(root, &merged).clone());
+        let round = RoundFacts {
+            has_retreat: before.diff_iter(after).0.next().is_some(),
+            replay_base_is_from: &replay_base == before,
+            merged_vv: merged,
+            merged_shallow_seed,
+            shallow_root_vv,
+            richtext_changes: Default::default(),
+        };
         let info = DiffCalcVersionInfo {
             from_vv: before,
             to_vv: after,
@@ -361,6 +521,7 @@ impl DiffCalculator {
             to_frontiers: after_frontiers,
             replay_base_vv: &replay_base,
             replay_base_is_critical,
+            round: &round,
         };
         while !all.is_empty() {
             // sort by depth and lamport, ensure we iterate from top to bottom
@@ -1026,13 +1187,14 @@ pub(crate) struct RichtextDiffCalculator {
 
 #[derive(Debug)]
 enum RichtextCalcMode {
+    /// The tracker is sparse (see `Tracker::sparse`), so it never proves it
+    /// holds every op up to a later round's replay base: each round starts a
+    /// new one at its base.
     Crdt {
         tracker: Box<RichtextTracker>,
         /// (op, end_pos)
         styles: Vec<(StyleOp, usize)>,
-        start_vv: VersionVector,
         source_not_in_op_context: bool,
-        shallow_root_seeded: bool,
     },
     Linear {
         diff: DeltaRope<RichtextStateChunk, ()>,
@@ -1044,11 +1206,9 @@ impl RichtextDiffCalculator {
     pub fn new() -> Self {
         Self {
             mode: Box::new(RichtextCalcMode::Crdt {
-                tracker: Box::new(RichtextTracker::new_with_unknown()),
+                tracker: Box::new(RichtextTracker::new_with_unknown().into_sparse()),
                 styles: Vec::new(),
-                start_vv: VersionVector::new(),
                 source_not_in_op_context: false,
-                shallow_root_seeded: false,
             }),
         }
     }
@@ -1328,6 +1488,31 @@ impl RichtextDiffCalculator {
         }
     }
 
+    /// A shallow document's root version, or `None` when it is not shallow.
+    fn shallow_root_vv(oplog: &OpLog) -> Option<VersionVector> {
+        if oplog.shallow_since_vv().is_empty() {
+            return None;
+        }
+        Some(
+            oplog
+                .dag
+                .frontiers_to_vv(oplog.shallow_since_frontiers())
+                .unwrap_or_else(|| oplog.shallow_since_vv().to_vv()),
+        )
+    }
+
+    /// The version a tracker replaying up from `vv` is seeded at in a
+    /// shallow document whose root is `root`.
+    fn shallow_seed<'a>(root: &'a VersionVector, vv: &'a VersionVector) -> &'a VersionVector {
+        if vv.includes_vv(root) {
+            root
+        } else {
+            vv
+        }
+    }
+
+    /// Seed `tracker` with the shallow root's state up to `seed_vv` (see
+    /// `shallow_seed`).
     #[cold]
     #[inline(never)]
     fn seed_tracker_from_shallow_root(
@@ -1335,23 +1520,10 @@ impl RichtextDiffCalculator {
         oplog: &OpLog,
         tracker: &mut RichtextTracker,
         styles: &mut Vec<(StyleOp, usize)>,
-        vv: &VersionVector,
+        seed_vv: &VersionVector,
     ) {
-        if oplog.shallow_since_vv().is_empty() {
-            return;
-        }
-
-        *tracker = RichtextTracker::new_empty();
+        *tracker = RichtextTracker::new_empty().into_sparse();
         styles.clear();
-        let shallow_root_vv = oplog
-            .dag
-            .frontiers_to_vv(oplog.shallow_since_frontiers())
-            .unwrap_or_else(|| oplog.shallow_since_vv().to_vv());
-        let seed_vv = if vv.includes_vv(&shallow_root_vv) {
-            &shallow_root_vv
-        } else {
-            vv
-        };
 
         #[derive(Debug, Clone, Copy)]
         struct SeedItem {
@@ -1493,48 +1665,79 @@ impl RichtextDiffCalculator {
     fn build_full_crdt_tracker(
         idx: ContainerIdx,
         oplog: &OpLog,
-        vv: &VersionVector,
+        round: &RoundFacts,
     ) -> (RichtextTracker, Vec<(StyleOp, usize)>) {
-        struct RichtextRebuildVisitor<'a> {
-            oplog: &'a OpLog,
-            tracker: &'a mut RichtextTracker,
-            styles: &'a mut Vec<(StyleOp, usize)>,
+        use crate::dag::Dag as _;
+
+        let mut tracker = RichtextTracker::new_with_unknown().into_sparse();
+        let mut styles = Vec::new();
+        if let Some(seed) = &round.merged_shallow_seed {
+            Self::seed_tracker_from_shallow_root(idx, oplog, &mut tracker, &mut styles, seed);
         }
 
-        impl RebuildOpVisitor for RichtextRebuildVisitor<'_> {
-            fn visit(&mut self, vv: &VersionVector, op: RichOp<'_>) {
-                self.tracker.checkout(vv);
-                RichtextDiffCalculator::apply_crdt_op_to_tracker(
-                    self.oplog,
-                    self.tracker,
-                    self.styles,
-                    op,
+        for &(_, peer, counter) in round.richtext_changes(oplog, idx) {
+            let change = oplog.get_change_at(ID::new(peer, counter)).unwrap();
+            let start_counter = round
+                .shallow_root_vv
+                .as_ref()
+                .and_then(|root| root.get(&peer).copied())
+                .unwrap_or(0)
+                .max(change.id.counter);
+            let end_counter = round
+                .merged_vv
+                .get(&peer)
+                .copied()
+                .unwrap_or(0)
+                .min(change.ctr_end());
+            let node = oplog.dag.get(change.id).unwrap();
+            let mut at = OpVersion::new(oplog.dag.ensure_vv_for(&node), change.id);
+
+            let iter_start = change
+                .ops
+                .binary_search_by(|op| op.ctr_last().cmp(&start_counter))
+                .unwrap_or_else(|e| e);
+            for mut op in &change.ops.vec()[iter_start..] {
+                if op.counter >= end_counter {
+                    break;
+                }
+
+                if op.container != idx || op.ctr_last() < start_counter {
+                    continue;
+                }
+
+                let stack_sliced_op;
+                if op.counter < start_counter || op.ctr_end() > end_counter {
+                    stack_sliced_op = Some(op.slice(
+                        (start_counter as usize).saturating_sub(op.counter as usize),
+                        op.atom_len().min((end_counter - op.counter) as usize),
+                    ));
+                    op = stack_sliced_op.as_ref().unwrap();
+                }
+
+                at.extend_to(op.counter);
+                tracker.checkout_by(|peer| at.counter_of(peer));
+                Self::apply_crdt_op_to_tracker(
+                    oplog,
+                    &mut tracker,
+                    &mut styles,
+                    RichOp::new_by_change(&change, op),
                 );
             }
         }
-
-        let mut tracker = RichtextTracker::new_with_unknown();
-        let mut styles = Vec::new();
-        if !oplog.shallow_since_vv().is_empty() {
-            Self::seed_tracker_from_shallow_root(idx, oplog, &mut tracker, &mut styles, vv);
-        }
-
-        let mut visitor = RichtextRebuildVisitor {
-            oplog,
-            tracker: &mut tracker,
-            styles: &mut styles,
-        };
-        replay_container_ops_from_empty(idx, oplog, vv, &mut visitor);
 
         (tracker, styles)
     }
 }
 
-impl DiffCalculatorTrait for RichtextDiffCalculator {
-    fn start_tracking(
+impl RichtextDiffCalculator {
+    /// Start a round at the replay base `vv`, the container's index `idx`
+    /// and, for a shallow document, the version to seed from its root.
+    pub(crate) fn start_round(
         &mut self,
-        _oplog: &super::oplog::OpLog,
-        vv: &crate::VersionVector,
+        oplog: &OpLog,
+        idx: ContainerIdx,
+        vv: &VersionVector,
+        shallow_seed: Option<&VersionVector>,
         mode: DiffMode,
     ) {
         match mode {
@@ -1551,26 +1754,46 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
             }
         }
 
-        match &mut *self.mode {
-            RichtextCalcMode::Crdt {
-                tracker,
-                styles,
-                start_vv,
-                source_not_in_op_context,
-                shallow_root_seeded,
-            } => {
-                *source_not_in_op_context = false;
-                if !vv.includes_vv(start_vv) || !tracker.all_vv().includes_vv(vv) {
-                    **tracker = RichtextTracker::new_with_unknown();
-                    styles.clear();
-                    *start_vv = vv.clone();
-                    *shallow_root_seeded = false;
-                }
-
-                tracker.checkout(vv);
+        if let RichtextCalcMode::Crdt {
+            tracker,
+            styles,
+            source_not_in_op_context,
+        } = &mut *self.mode
+        {
+            *source_not_in_op_context = false;
+            **tracker = RichtextTracker::new_with_unknown().into_sparse();
+            styles.clear();
+            if let Some(seed) = shallow_seed {
+                Self::seed_tracker_from_shallow_root(idx, oplog, tracker, styles, seed);
             }
-            RichtextCalcMode::Linear { .. } => {}
+            tracker.checkout(vv);
         }
+    }
+
+    /// `apply_change`, checking the tracker out to `at` when given.
+    pub(crate) fn apply_change_at(
+        &mut self,
+        oplog: &OpLog,
+        op: crate::op::RichOp,
+        at: Option<&OpVersion>,
+    ) {
+        if let (Some(at), RichtextCalcMode::Crdt { tracker, .. }) = (at, &mut *self.mode) {
+            tracker.checkout_by(|peer| at.counter_of(peer));
+        }
+        self.apply_change(oplog, op, None);
+    }
+}
+
+impl DiffCalculatorTrait for RichtextDiffCalculator {
+    /// Rounds start through `start_round`, which knows the container; this
+    /// is never called.
+    fn start_tracking(
+        &mut self,
+        _oplog: &super::oplog::OpLog,
+        _vv: &crate::VersionVector,
+        _mode: DiffMode,
+    ) {
+        unreachable!("a richtext round starts through start_round")
     }
 
     fn apply_change(
@@ -1658,21 +1881,8 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
             RichtextCalcMode::Crdt {
                 tracker,
                 styles,
-                start_vv,
                 source_not_in_op_context: _,
-                shallow_root_seeded,
             } => {
-                if !*shallow_root_seeded && !oplog.shallow_since_vv().is_empty() {
-                    Self::seed_tracker_from_shallow_root(
-                        op.raw_op().container,
-                        oplog,
-                        tracker,
-                        styles,
-                        start_vv,
-                    );
-                    *shallow_root_seeded = true;
-                }
-
                 if let Some(vv) = vv {
                     tracker.checkout(vv);
                 }
@@ -1804,8 +2014,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                 source_not_in_op_context,
                 ..
             } => {
-                let (mut retreat, _) = info.from_vv.diff_iter(info.to_vv);
-                let has_retreat = retreat.next().is_some();
+                let has_retreat = info.round.has_retreat;
                 // The tracker models everything below its seed version as one
                 // opaque "unknown" span: it can never be retreated and its
                 // interior has no ids. Trusting it is sound exactly when no
@@ -1815,17 +2024,13 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                 // inside the replayed region, and the alive-set of below-base
                 // content is identical at every checkout the replay performs,
                 // so the opaque span is a faithful, length-stable model of
-                // the base state. A reused tracker may be seeded even lower
-                // (`start_vv` ⊆ base); criticality transfers down, because an
-                // op concurrent with an event in `Events(start_vv)` would be
-                // concurrent with that same event in `Events(base)`.
-                // A base only known to lie in the causal past of both sides
+                // the base state. A base only known to lie in the causal past of both sides
                 // gives no such promise (`source_not_in_op_context` then
                 // reports replayed ops whose causal context misses the source
                 // state), so fall back to reconstructing the target state from
                 // CRDT ids.
                 let base_is_trustworthy = info.replay_base_is_critical
-                    || (info.replay_base_vv == info.from_vv && !*source_not_in_op_context);
+                    || (info.round.replay_base_is_from && !*source_not_in_op_context);
                 let should_rebuild =
                     has_retreat || !base_is_trustworthy || !oplog.shallow_since_vv().is_empty();
                 if should_rebuild {
@@ -1840,10 +2045,8 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     // shallow-root state and replay only the retained suffix of history.
                     #[cfg(test)]
                     FULL_TRACKER_REBUILD_COUNT.with(|c| c.set(c.get() + 1));
-                    let mut merged = info.from_vv.clone();
-                    merged.merge(info.to_vv);
                     let (mut full_tracker, full_styles) =
-                        Self::build_full_crdt_tracker(idx, oplog, &merged);
+                        Self::build_full_crdt_tracker(idx, oplog, info.round);
 
                     let mut delta = DeltaRope::new();
                     for item in full_tracker.diff(info.from_vv, info.to_vv) {
@@ -1851,10 +2054,6 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     }
                     **tracker = full_tracker;
                     *styles = full_styles;
-                    // `start_vv` is deliberately left as-is: the rebuild's
-                    // real seed is even lower (the empty version, or the
-                    // shallow root), so the reseed test in `start_tracking`
-                    // only becomes more conservative.
 
                     return (InternalDiff::RichtextRaw(delta), DiffMode::Checkout);
                 }
@@ -2503,12 +2702,10 @@ fn conservative_checkout_replay_filters_to_retreat_changed_containers() {
     assert_single_map_value_diff(&diffs, expected_idx, "value", 0.into());
 }
 
-/// A persisted calculator (the shape `LoroDoc::checkout` drives) replays
-/// ops its tracker has already applied whenever the tracker was rebuilt
-/// past `from`: here a retreat rebuilds it over the whole history, and the
-/// forward walk that follows re-replays every op. The tracker skips those
-/// inserts, but the style table must not grow a duplicate entry per
-/// re-replayed StyleStart.
+/// A persisted calculator (the shape `LoroDoc::checkout` drives) walked
+/// back over the whole history and forward again, step by step, leaves a
+/// style table with each StyleStart of its last step once: no round inherits
+/// an earlier round's tracker or styles.
 #[test]
 fn persisted_walk_does_not_duplicate_style_entries() {
     use crate::{cursor::PosType, handler::HandlerTrait, LoroDoc};
@@ -2546,6 +2743,10 @@ fn persisted_walk_does_not_duplicate_style_entries() {
     let ContainerDiffCalculator::Richtext(text) = c else {
         panic!("expected a richtext calculator");
     };
+    // Each round starts its tracker at its own base, so the table holds the
+    // last step's styles, each once.
     let ids = text.tracked_style_ids();
-    assert_eq!(ids.len(), marks, "duplicate style entries: {ids:?}");
+    let unique: FxHashSet<ID> = ids.iter().copied().collect();
+    assert!(!ids.is_empty());
+    assert_eq!(unique.len(), ids.len(), "duplicate style entries: {ids:?}");
 }
