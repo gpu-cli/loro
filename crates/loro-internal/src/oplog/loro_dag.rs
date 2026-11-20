@@ -813,6 +813,22 @@ impl AppDag {
             return true;
         }
 
+        // The root node's version is the shallow vv, and a version only grows
+        // along causality, so a dep at or after the root covers it. Asking
+        // that is a lookup; comparing whole versions walks every peer.
+        if let Some(root) = self.shallow_since_frontiers.as_single() {
+            for dep in deps.iter() {
+                if dep.peer == root.peer && dep.counter >= root.counter {
+                    return false;
+                }
+                if let Some(node) = self.get(dep) {
+                    if self.ensure_vv_for(&node).includes_id(root) {
+                        return false;
+                    }
+                }
+            }
+        }
+
         let shallow_vv = VersionVector::from_im_vv(&self.shallow_since_vv);
         if let Some(vv) = self.frontiers_to_vv(deps) {
             return !vv.includes_vv(&shallow_vv);

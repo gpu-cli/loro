@@ -31,11 +31,15 @@ use crate::LoroError;
 use change_store::{BlockOpRef, ChangeStoreRollback};
 use loro_common::{ContainerType, HasIdSpan, IdLp, IdSpan};
 use rle::{HasLength, RleVec, Sliceable};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 pub use self::loro_dag::{AppDag, AppDagNode, FrontiersNotIncluded};
 pub use change_store::{BlockChangeRef, ChangeStore};
+
+/// Per container, the changes with an op on it, each named by its lamport,
+/// peer and start counter, in causal order.
+pub(crate) type ChangesByContainer = FxHashMap<ContainerIdx, Vec<(Lamport, PeerID, Counter)>>;
 
 /// [OpLog] store all the ops i.e. the history.
 /// It allows multiple [AppState] to attach to it.
@@ -244,8 +248,13 @@ impl OpLog {
             .import_rollback
             .as_ref()
             .and_then(|x| (!x.old_vv.is_empty()).then_some(&x.old_vv));
+        let peer = change.id.peer;
+        let end_before = self.dag.vv().get(&peer).copied().unwrap_or(0);
         self.dag
             .handle_new_change(&change, from_local, rollback_old_vv);
+        // A new change is after the shallow root, so every op it adds to the
+        // version is visible. Recounting instead walks every peer's counter.
+        let end_after = self.dag.vv().get(&peer).copied().unwrap_or(0);
         self.history_cache
             .lock()
             .insert_by_new_change(&change, true, true);
@@ -260,7 +269,7 @@ impl OpLog {
         } else {
             self.change_store.insert_change(change, true, from_local);
         }
-        self.refresh_visible_op_count();
+        self.inc_visible_op_count((end_after - end_before).max(0) as usize);
     }
 
     pub(crate) fn begin_import_rollback(&mut self) {
@@ -570,6 +579,54 @@ impl OpLog {
 
     pub fn get_change_at(&self, id: ID) -> Option<BlockChangeRef> {
         self.change_store.get_change(id)
+    }
+
+    /// Every change with an op in `start..end` on a container `wanted`
+    /// keeps, listed under each such container in causal order, as
+    /// `(lamport, peer, counter of the change's first op)`. One walk of the
+    /// whole store, for a caller that would otherwise walk it once per
+    /// container.
+    pub(crate) fn changes_by_container(
+        &self,
+        start: &VersionVector,
+        end: &VersionVector,
+        wanted: impl Fn(ContainerIdx) -> bool,
+    ) -> ChangesByContainer {
+        let mut ans: ChangesByContainer = FxHashMap::default();
+        self.change_store.visit_all_changes(&mut |change| {
+            let peer = change.id.peer;
+            let from = start
+                .get(&peer)
+                .copied()
+                .unwrap_or(0)
+                .max(change.id.counter);
+            let to = end.get(&peer).copied().unwrap_or(0).min(change.ctr_end());
+            if from >= to {
+                return;
+            }
+            let mut last = None;
+            for op in change.ops.iter() {
+                if op.ctr_end() <= from || op.counter >= to || last == Some(op.container) {
+                    continue;
+                }
+                last = Some(op.container);
+                if !wanted(op.container) {
+                    continue;
+                }
+                let entries = ans.entry(op.container).or_default();
+                let entry = (change.lamport, peer, change.id.counter);
+                if entries.last() != Some(&entry) {
+                    entries.push(entry);
+                }
+            }
+        });
+        // A change's lamport is above every change it depends on, so
+        // (lamport, peer) order is causal.
+        for entries in ans.values_mut() {
+            entries.sort_unstable();
+            entries.dedup();
+        }
+        ans
     }
 
     pub(crate) fn set_uncommitted_change(&mut self, change: Change) {
@@ -973,7 +1030,10 @@ impl OpLog {
         loro_common::debug!("to_frontiers={:?} vv={:?}", &to_frontiers, to);
         let mut concurrent_containers = None;
         let mut register_only_base = None;
-        if to > from {
+        // Nothing is concurrent with the empty version, so a replay from it
+        // has no entry change to look for, and looking would read every
+        // change in the store.
+        if to > from && !from.is_empty() {
             // `to ⊇ from`, but some new ops may be concurrent with part of
             // `from`. The DAG walk must then assume the worst and retreat
             // to a critical version; with container knowledge we can often

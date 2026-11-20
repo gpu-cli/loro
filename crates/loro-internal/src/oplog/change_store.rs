@@ -128,6 +128,9 @@ struct ChangeStoreInner {
     start_frontiers: Frontiers,
     /// It's more like a parsed cache for binary_kv.
     mem_parsed_kv: BTreeMap<ID, Arc<ChangesBlock>>,
+    /// Every block of `external_kv` is in `mem_parsed_kv`, so loading a range
+    /// need not scan (and decompress) the kv store again.
+    external_loaded: bool,
 }
 
 #[derive(Debug)]
@@ -191,6 +194,7 @@ impl ChangeStore {
                 start_vv: ImVersionVector::new(),
                 start_frontiers: Frontiers::default(),
                 mem_parsed_kv: BTreeMap::new(),
+                external_loaded: false,
             })),
             arena: a.clone(),
             external_vv: Arc::new(Mutex::new(VersionVector::new())),
@@ -355,6 +359,7 @@ impl ChangeStore {
         // The name set may already include names from changes this rollback removes. That is
         // fine: stale names only make `old_history_may_touch_root_names` conservatively true.
         let mut inner = self.inner.lock();
+        inner.external_loaded = false;
         inner.mem_parsed_kv.retain(|id, _| {
             let old_end = rollback.old_vv.get(&id.peer).copied().unwrap_or(0);
             id.counter < old_end
@@ -696,6 +701,7 @@ impl ChangeStore {
                 start_vv: inner.start_vv.clone(),
                 start_frontiers: inner.start_frontiers.clone(),
                 mem_parsed_kv: BTreeMap::new(),
+                external_loaded: false,
             })),
             arena,
             external_vv: Arc::new(Mutex::new(self.external_vv.lock().clone())),
@@ -820,6 +826,7 @@ mod mut_external_kv {
                 .import_all(bytes)
                 .map_err(|e| LoroError::DecodeError(e.into_boxed_str()))?;
             drop(kv_store);
+            self.inner.lock().external_loaded = false;
             *self.root_history_names.lock() = RootHistoryNamesState::Uninitialized;
             let vv_bytes = self.external_kv.lock().get(VV_KEY).unwrap_or_default();
             let vv = VersionVector::decode(&vv_bytes)
@@ -1405,6 +1412,10 @@ mod mut_inner_kv {
         /// This is fast because we don't actually parse the content.
         // TODO: PERF: This method feels slow.
         pub(super) fn ensure_block_loaded_in_range(&self, start: Bound<ID>, end: Bound<ID>) {
+            if self.inner.lock().external_loaded {
+                return;
+            }
+            let loads_all = matches!((start, end), (Bound::Unbounded, Bound::Unbounded));
             let mut whether_need_scan_backward = match start {
                 Bound::Included(id) => Some(id),
                 Bound::Excluded(id) => Some(id.inc(1)),
@@ -1416,6 +1427,7 @@ mod mut_inner_kv {
                 let end = end.map(|id| id.to_bytes());
                 let kv = self.external_kv.lock();
                 let mut inner = self.inner.lock();
+                let mut failed = false;
                 for (id, bytes) in kv
                     .scan(
                         start.as_ref().map(|x| x.as_slice()),
@@ -1438,11 +1450,15 @@ mod mut_inner_kv {
                         Ok(block) => block,
                         Err(err) => {
                             warn!(?id, ?err, "failed to decode external change block");
+                            failed = true;
                             continue;
                         }
                     };
                     inner.mem_parsed_kv.insert(id, Arc::new(block));
                 }
+                // A block that failed to decode stays out, and the next load
+                // scans for it again.
+                inner.external_loaded = loads_all && !failed;
             }
 
             if let Some(start_id) = whether_need_scan_backward {
